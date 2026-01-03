@@ -1,0 +1,422 @@
+---
+# playbook_restart_proxy_services.yml
+# Playbook para reiniciar servicios Squid, Privoxy y Tor en nodo específico
+# Nodo objetivo: 172.24.10.237
+
+- name: "🔄 Reinicio Controlado de Servicios Proxy"
+  hosts: "{{ target_host | default('172.24.10.237') }}"
+  gather_facts: yes
+  become: yes
+  serial: 1  # Importante: Reiniciar uno por uno si hay múltiples hosts
+  
+  vars:
+    # Configuración de servicios
+    services_to_restart:
+      - name: squid
+        service: "{{ squid_service_name | default('squid') }}"
+        port: "{{ squid_port | default(3128) }}"
+        config_file: "{{ squid_config | default('/etc/squid/squid.conf') }}"
+        check_command: "squid -k parse"
+        dependencies: []
+        
+      - name: tor
+        service: "{{ tor_service_name | default('tor') }}"
+        port: "{{ tor_port | default(9050) }}"
+        config_file: "{{ tor_config | default('/etc/tor/torrc') }}"
+        check_command: "tor --verify-config"
+        dependencies: []
+        
+      - name: privoxy
+        service: "{{ privoxy_service_name | default('privoxy') }}"
+        port: "{{ privoxy_port | default(8118) }}"
+        config_file: "{{ privoxy_config | default('/etc/privoxy/config') }}"
+        check_command: "privoxy --config-test {{ privoxy_config | default('/etc/privoxy/config') }}"
+        dependencies: []
+    
+    # Parámetros de ejecución
+    restart_timeout: 30
+    max_retries: 3
+    wait_between_services: 10
+    backup_configs: true
+    audit_log: "/var/log/proxy_restart_audit.log"
+    
+    # Notificaciones (opcional)
+    send_notifications: false
+    notification_email: "admin@example.com"
+  
+  # Pre-tasks: Validaciones previas
+  pre_tasks:
+    - name: "📋 Verificar que el host es alcanzable"
+      ping:
+      register: host_ping
+    
+    - name: "⚠️ Terminar si el host no es alcanzable"
+      fail:
+        msg: "Host {{ inventory_hostname }} no está alcanzable"
+      when: host_ping.ping != "pong"
+    
+    - name: "🔍 Detectar sistema operativo"
+      debug:
+        msg: "Sistema detectado: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+    
+    - name: "📊 Verificar espacio en disco"
+      shell: df -h / | tail -1 | awk '{print $5}' | sed 's/%//'
+      register: disk_usage
+      changed_when: false
+    
+    - name: "⚠️ Advertencia si espacio en disco es crítico"
+      debug:
+        msg: "⚠️ Advertencia: Uso de disco en / es {{ disk_usage.stdout }}% - Considera limpiar espacio"
+      when: disk_usage.stdout | int > 80
+
+  tasks:
+    # Bloque 1: Verificar servicios instalados
+    - name: "📦 Verificar que los servicios están instalados"
+      block:
+        - name: "Obtener información de paquetes"
+          package_facts:
+        
+        - name: "Mostrar estado de instalación"
+          debug:
+            msg: |
+              Servicios instalados en {{ inventory_hostname }}:
+              {% for service in services_to_restart %}
+              - {{ service.name }}: {{ '✅ INSTALADO' if service.name in ansible_facts.packages else '❌ NO INSTALADO' }}
+              {% endfor %}
+      
+      rescue:
+        - name: "🚨 Error verificando paquetes"
+          debug:
+            msg: "No se pudo verificar los paquetes instalados"
+    
+    # Bloque 2: Crear backup de configuraciones
+    - name: "💾 Crear backups de configuraciones"
+      block:
+        - name: "Crear directorio de backups"
+          file:
+            path: "/backup/proxy_configs/{{ ansible_date_time.date }}"
+            state: directory
+            mode: '0755'
+          when: backup_configs
+        
+        - name: "Backup de archivos de configuración"
+          copy:
+            remote_src: yes
+            src: "{{ item.config_file }}"
+            dest: "/backup/proxy_configs/{{ ansible_date_time.date }}/{{ item.name }}.conf.backup"
+            mode: '0644'
+          loop: "{{ services_to_restart }}"
+          when: 
+            - backup_configs
+            - item.config_file is defined
+          register: backup_results
+          ignore_errors: yes
+        
+        - name: "Mostrar resultado de backups"
+          debug:
+            msg: "Backups creados: {{ backup_results.results | selectattr('changed') | map(attribute='item.name') | list }}"
+          when: backup_configs
+      
+      tags: backup
+    
+    # Bloque 3: Verificar configuraciones antes de reiniciar
+    - name: "🔧 Validar configuraciones de servicios"
+      block:
+        - name: "Verificar sintaxis de configuración"
+          command: "{{ item.check_command }}"
+          loop: "{{ services_to_restart }}"
+          register: config_checks
+          ignore_errors: yes
+          changed_when: false
+        
+        - name: "Mostrar resultados de validación"
+          debug:
+            msg: |
+              Validación de configuraciones:
+              {% for check in config_checks.results %}
+              - {{ services_to_restart[loop.index0].name }}: {{ '✅ VÁLIDA' if check.rc == 0 else '❌ ERROR: ' + check.stderr }}
+              {% endfor %}
+      
+      tags: validate
+    
+    # Bloque 4: Verificar conexiones activas
+    - name: "📡 Verificar conexiones activas antes del reinicio"
+      block:
+        - name: "Contar conexiones activas por servicio"
+          shell: |
+            # Script para contar conexiones
+            case "{{ item.name }}" in
+              squid)
+                netstat -an | grep :{{ item.port }} | grep ESTABLISHED | wc -l
+                ;;
+              tor)
+                ss -tulpn | grep :{{ item.port }} | wc -l
+                ;;
+              privoxy)
+                netstat -an | grep :{{ item.port }} | grep -i listen | wc -l
+                ;;
+              *)
+                echo "0"
+                ;;
+            esac
+          loop: "{{ services_to_restart }}"
+          register: active_connections_before
+          changed_when: false
+        
+        - name: "Mostrar conexiones activas"
+          debug:
+            msg: |
+              Conexiones activas antes del reinicio:
+              {% for conn in active_connections_before.results %}
+              - {{ services_to_restart[loop.index0].name }}: {{ conn.stdout }} conexión(es)
+              {% endfor %}
+      
+      tags: monitor
+    
+    # Bloque 5: Reiniciar servicios con manejo de errores
+    - name: "🔄 Reiniciar servicios proxy"
+      block:
+        - name: "Reiniciar cada servicio"
+          systemd:
+            name: "{{ item.service }}"
+            state: restarted
+            enabled: yes
+            daemon_reload: yes
+          loop: "{{ services_to_restart }}"
+          register: restart_results
+          async: "{{ restart_timeout }}"
+          poll: 5
+          retries: "{{ max_retries }}"
+          delay: 5
+          until: restart_results is succeeded
+        
+        - name: "Esperar entre servicios"
+          pause:
+            seconds: "{{ wait_between_services }}"
+          when: wait_between_services > 0
+        
+        - name: "Mostrar resultados del reinicio"
+          debug:
+            msg: |
+              Resultados del reinicio:
+              {% for result in restart_results.results %}
+              - {{ services_to_restart[loop.index0].name }}: {{ '✅ REINICIADO' if result.changed else '⚠️ SIN CAMBIOS (ya estaba corriendo)' }}
+              {% endfor %}
+      
+      rescue:
+        - name: "🚨 Error reiniciando servicios - Intentar inicio simple"
+          debug:
+            msg: "Error en reinicio, intentando inicio simple"
+          
+          - name: "Intentar start en lugar de restart"
+            systemd:
+              name: "{{ item.service }}"
+              state: started
+            loop: "{{ services_to_restart }}"
+            when: restart_results.failed
+      
+      tags: restart
+    
+    # Bloque 6: Verificar servicios después del reinicio
+    - name: "✅ Verificación post-reinicio"
+      block:
+        - name: "Verificar estado de servicios"
+          systemd:
+            name: "{{ item.service }}"
+          loop: "{{ services_to_restart }}"
+          register: service_status_after
+          changed_when: false
+        
+        - name: "Verificar puertos en escucha"
+          wait_for:
+            host: "{{ ansible_default_ipv4.address | default('127.0.0.1') }}"
+            port: "{{ item.port }}"
+            state: started
+            delay: 5
+            timeout: 30
+          loop: "{{ services_to_restart }}"
+          register: port_checks
+        
+        - name: "Contar conexiones después del reinicio"
+          shell: |
+            sleep 5  # Esperar estabilización
+            case "{{ item.name }}" in
+              squid)
+                netstat -an | grep :{{ item.port }} | grep ESTABLISHED | wc -l
+                ;;
+              tor)
+                ss -tulpn | grep :{{ item.port }} | wc -l
+                ;;
+              privoxy)
+                netstat -an | grep :{{ item.port }} | grep -i listen | wc -l
+                ;;
+              *)
+                echo "0"
+                ;;
+            esac
+          loop: "{{ services_to_restart }}"
+          register: active_connections_after
+          changed_when: false
+        
+        - name: "📋 Generar reporte de verificación"
+          debug:
+            msg: |
+              ================================================
+              🎯 REPORTE DE VERIFICACIÓN - {{ inventory_hostname }}
+              ================================================
+              {% for service in services_to_restart %}
+              {{ service.name | upper }}:
+                Estado servicio: {{ service_status_after.results[loop.index0].state }}
+                Activo: {{ service_status_after.results[loop.index0].active }}
+                Puerto {{ service.port }}: {{ '✅ ESCUCHANDO' if port_checks.results[loop.index0].state == 'started' else '❌ NO ESCUCHA' }}
+                Conexiones antes: {{ active_connections_before.results[loop.index0].stdout }}
+                Conexiones después: {{ active_connections_after.results[loop.index0].stdout }}
+              {% endfor %}
+              ================================================
+      
+      tags: verify
+    
+    # Bloque 7: Pruebas funcionales
+    - name: "🧪 Pruebas funcionales de servicios"
+      block:
+        - name: "Probar Squid - HTTP request básica"
+          shell: |
+            timeout 10 curl -s -o /dev/null -w "%{http_code}" -x http://localhost:{{ squid_port | default(3128) }} http://example.com || echo "FAILED"
+          register: squid_test
+          ignore_errors: yes
+          when: "'squid' in ansible_facts.packages"
+        
+        - name: "Probar Tor - Verificar conexión Tor"
+          shell: |
+            timeout 15 curl -s --socks5 localhost:{{ tor_port | default(9050) }} http://check.torproject.org | grep -q "Congratulations" && echo "TOR_OK" || echo "TOR_FAILED"
+          register: tor_test
+          ignore_errors: yes
+          when: "'tor' in ansible_facts.packages"
+        
+        - name: "Probar Privoxy - HTTP request"
+          shell: |
+            timeout 10 curl -s -o /dev/null -w "%{http_code}" -x http://localhost:{{ privoxy_port | default(8118) }} http://example.com || echo "FAILED"
+          register: privoxy_test
+          ignore_errors: yes
+          when: "'privoxy' in ansible_facts.packages"
+        
+        - name: "Mostrar resultados de pruebas"
+          debug:
+            msg: |
+              Pruebas funcionales:
+              - Squid: {{ '✅ FUNCIONA' if squid_test.stdout == '200' else '❌ FALLA: ' + squid_test.stdout }}
+              - Tor: {{ '✅ FUNCIONA' if tor_test.stdout == 'TOR_OK' else '❌ FALLA' }}
+              - Privoxy: {{ '✅ FUNCIONA' if privoxy_test.stdout == '200' else '❌ FALLA: ' + privoxy_test.stdout }}
+      
+      tags: test
+
+  # Post-tasks: Limpieza y reporte final
+  post_tasks:
+    - name: "📝 Registrar en log de auditoría"
+      block:
+        - name: "Crear entrada de log"
+          lineinfile:
+            path: "{{ audit_log }}"
+            line: |
+              [{{ ansible_date_time.iso8601 }}] {{ inventory_hostname }} - REINICIO PROXY
+              Servicios: squid, tor, privoxy
+              Usuario: {{ ansible_user_id }}
+              Resultado: {{ 'EXITOSO' if restart_results is defined and not restart_results.failed else 'FALLIDO' }}
+              =================================
+            create: yes
+            owner: root
+            group: root
+            mode: '0644'
+      
+      tags: audit
+    
+    - name: "📤 Enviar notificación por email (opcional)"
+      mail:
+        to: "{{ notification_email }}"
+        subject: "Reinicio de servicios proxy - {{ inventory_hostname }}"
+        body: |
+          Reinicio de servicios proxy completado en {{ inventory_hostname }}
+          
+          Servicios reiniciados:
+          - Squid: {{ '✅' if squid_test.stdout == '200' else '❌' }}
+          - Tor: {{ '✅' if tor_test.stdout == 'TOR_OK' else '❌' }}
+          - Privoxy: {{ '✅' if privoxy_test.stdout == '200' else '❌' }}
+          
+          Hora: {{ ansible_date_time.iso8601 }}
+          Usuario: {{ ansible_user_id }}
+      delegate_to: localhost
+      when: send_notifications and notification_email is defined
+    
+    - name: "🎉 Resumen final de ejecución"
+      debug:
+        msg: |
+          ================================================
+          ✅ REINICIO COMPLETADO EN {{ inventory_hostname }}
+          ================================================
+          Servicios procesados: {{ services_to_restart | length }}
+          Tiempo estimado: {{ (restart_timeout * services_to_restart | length) + (wait_between_services * (services_to_restart | length - 1)) }} segundos
+          Log de auditoría: {{ audit_log }}
+          Backup creado: {{ 'Sí' if backup_configs else 'No' }}
+          ================================================
+          Comandos de verificación manual:
+          - Squid: systemctl status squid
+          - Tor: systemctl status tor
+          - Privoxy: systemctl status privoxy
+          ================================================
+
+  # Handlers para operaciones específicas
+  handlers:
+    - name: "🔄 Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+      listen: "reload systemd"
+    
+    - name: "📊 Generar reporte detallado"
+      copy:
+        dest: "/tmp/proxy_restart_report_{{ ansible_date_time.date }}.txt"
+        content: |
+          Reporte de reinicio - {{ inventory_hostname }}
+          Fecha: {{ ansible_date_time.iso8601 }}
+          {% for service in services_to_restart %}
+          {{ service.name }}:
+            Estado: {{ service_status_after.results[loop.index0].state | default('UNKNOWN') }}
+            Puerto: {{ service.port }}
+            Config: {{ service.config_file }}
+          {% endfor %}
+      listen: "generate report"
+    
+    - name: "🔔 Notificar canal de monitoreo"
+      debug:
+        msg: "Notificar a canal de monitoreo sobre reinicio"
+      listen: "notify monitoring"
+
+  # Manejo de errores global
+  rescue:
+    - name: "🚨 CAPTURA DE ERROR GLOBAL"
+      debug:
+        msg: |
+          ERROR DETECTADO EN EL PLAYBOOK
+          Host: {{ inventory_hostname }}
+          Tarea fallida: {{ ansible_failed_task.name }}
+          Error: {{ ansible_failed_result.msg }}
+      
+    - name: "🆘 Primeros auxilios - Verificar servicios caídos"
+      shell: |
+        for service in squid tor privoxy; do
+          if systemctl is-active --quiet $service; then
+            echo "$service: ACTIVE"
+          else
+            echo "$service: INACTIVE - Attempting start..."
+            systemctl start $service
+          fi
+        done
+      register: first_aid
+      
+    - name: "📞 Instrucciones de recuperación"
+      debug:
+        msg: |
+          INSTRUCCIONES DE RECUPERACIÓN:
+          1. Verificar logs: journalctl -u squid -u tor -u privoxy --since "5 minutes ago"
+          2. Revisar configuraciones en /backup/proxy_configs/
+          3. Intentar inicio manual: systemctl start squid tor privoxy
+          4. Verificar puertos: netstat -tulpn | grep -E ':(3128|9050|8118)'

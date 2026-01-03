@@ -1,0 +1,25 @@
+# inventory_single_host.yml
+# Inventario para un solo host con autenticación
+
+all:
+  hosts:
+    proxy_node:
+      ansible_host: 172.24.10.237
+      ansible_user: "{{ ssh_user | default('chicho') }}"
+      ansible_connection: ssh
+      ansible_port: 22
+      ansible_become: yes
+      ansible_become_method: sudo
+      
+      # Variables específicas del nodo
+      squid_port: 3128
+      tor_port: 9050
+      privoxy_port: 8118
+      squid_service_name: squid
+      tor_service_name: tor
+      privoxy_service_name: privoxy
+      
+  vars:
+    # Configuración global
+    ansible_python_interpreter: /usr/bin/python3
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o ConnectTimeout=30'

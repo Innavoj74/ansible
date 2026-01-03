@@ -1,0 +1,46 @@
+---
+# restart_proxy_simple.yml
+# Versión simplificada para reinicio rápido
+
+- name: Reinicio rápido de servicios proxy
+  hosts: "172.24.10.237"
+  become: yes
+  
+  tasks:
+    - name: Reiniciar Squid
+      systemd:
+        name: squid
+        state: restarted
+      register: squid_result
+    
+    - name: Reiniciar Tor
+      systemd:
+        name: tor
+        state: restarted
+      register: tor_result
+    
+    - name: Reiniciar Privoxy
+      systemd:
+        name: privoxy
+        state: restarted
+      register: privoxy_result
+    
+    - name: Esperar 10 segundos
+      pause:
+        seconds: 10
+    
+    - name: Verificar servicios
+      systemd:
+        name: "{{ item }}"
+      loop:
+        - squid
+        - tor
+        - privoxy
+    
+    - name: Mostrar resultado
+      debug:
+        msg: |
+          Servicios reiniciados en 172.24.10.237:
+          - Squid: {{ '✅' if squid_result.changed else '⚠️' }}
+          - Tor: {{ '✅' if tor_result.changed else '⚠️' }}
+          - Privoxy: {{ '✅' if privoxy_result.changed else '⚠️' }}

@@ -1,0 +1,61 @@
+---
+# playbook_diagnostic.yml
+- name: 🔍 SSH Connection Diagnostic
+  hosts: all
+  gather_facts: no
+  
+  vars:
+    ansible_user: "{{ ssh_user | default('chicho') }}"
+    
+  tasks:
+    - name: 1️⃣ Test SSH connectivity
+      wait_for_connection:
+        timeout: 30
+      ignore_errors: yes
+      register: ssh_test
+    
+    - name: 2️⃣ Show SSH test result
+      debug:
+        msg: "SSH Test: {{ 'SUCCESS' if ssh_test.success else 'FAILED' }}"
+    
+    - name: 3️⃣ Try different authentication methods
+      block:
+        - name: Try with public key
+          shell: ssh -o ConnectTimeout=5 -o BatchMode=yes {{ ansible_user }}@{{ inventory_hostname }} "echo publickey_test"
+          register: pubkey_test
+          ignore_errors: yes
+        
+        - name: Try with password (if asked)
+          shell: |
+            echo "password_test" | sshpass -p "dummy" ssh {{ ansible_user }}@{{ inventory_hostname }} "echo test"
+          register: password_test
+          ignore_errors: yes
+        
+        - name: Show authentication methods
+          debug:
+            msg: |
+              Authentication methods tried:
+              - Public Key: {{ 'AVAILABLE' if pubkey_test.rc == 0 else 'NOT AVAILABLE' }}
+              - Password: {{ 'REQUIRED' if password_test.rc == 6 else 'NOT REQUIRED' }}
+      when: ssh_test.success
+    
+    - name: 4️⃣ Check SSH service on remote
+      delegate_to: localhost
+      shell: nc -z -w5 {{ inventory_hostname }} 22
+      register: port_check
+      ignore_errors: yes
+    
+    - name: 5️⃣ Final diagnosis
+      debug:
+        msg: |
+          =========================================
+          DIAGNOSIS REPORT for {{ inventory_hostname }}
+          =========================================
+          SSH Port (22) Open: {{ 'YES' if port_check.rc == 0 else 'NO' }}
+          SSH Authentication: {{ 'SUCCESS' if ssh_test.success else 'FAILED' }}
+          Possible Issues:
+          {{ '  - Wrong username/password' if ssh_test.failed else '' }}
+          {{ '  - SSH service not running' if port_check.rc != 0 else '' }}
+          {{ '  - Firewall blocking port 22' if port_check.rc != 0 else '' }}
+          {{ '  - User account disabled' if ssh_test.failed and port_check.rc == 0 else '' }}
+          =========================================
